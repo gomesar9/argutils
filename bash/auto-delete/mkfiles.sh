@@ -1,5 +1,6 @@
 #!/bin/bash
 
+mkdir -p ./files
 rm -f ./files/*
 
 touch -d "1 day ago" ./files/01_day

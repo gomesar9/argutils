@@ -1,2 +1,0 @@
-# Reduce pdf file size
-convert -density 200x200 -quality 60 -compress jpeg input.pdf output.pdf
