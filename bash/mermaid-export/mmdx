@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# mmdx — render Mermaid (.mmd) files via mmdc with parallelism, CLI args,
+# skip-if-fresh, and a clear pass/fail summary.
+
+set -uo pipefail
+shopt -s nullglob
+
+PROG=${0##*/}
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options] [FILE|DIR ...]
+
+Render Mermaid .mmd files to images using mmdc.
+
+Options:
+  -f, --format FMT       Output format: png|svg|pdf (interactive if omitted)
+  -o, --outdir DIR       Output directory (default: ./out)
+  -j, --jobs N           Parallel jobs (default: nproc, max 8)
+  -t, --theme THEME      Mermaid theme: default|dark|forest|neutral
+  -b, --background BG    Background: transparent|white|#rrggbb
+  -w, --width PX         Width in pixels
+  -H, --height PX        Height in pixels
+  -s, --scale N          Scale factor (e.g. 2)
+  -p, --puppeteer FILE   Puppeteer config JSON (for sandbox/Docker)
+  -r, --recursive        Recurse into directories looking for *.mmd
+      --force            Re-render even if output is newer than input
+  -q, --quiet            Suppress per-file progress
+  -h, --help             Show this help
+
+Positional args: files or directories. Default: *.mmd in current dir.
+
+Examples:
+  $PROG                          # interactive: pick format, render ./*.mmd
+  $PROG -f svg -j 4              # render all .mmd in cwd as svg, 4 jobs
+  $PROG -f png -r src/diagrams   # recurse into src/diagrams
+  $PROG --force -t dark a.mmd    # re-render a.mmd with dark theme
+EOF
+}
+
+err()  { printf '\e[31m✖\e[0m %s\n' "$*" >&2; }
+warn() { printf '\e[33m⚠\e[0m %s\n' "$*" >&2; }
+
+# ---------- arg parsing ----------
+FORMAT=""
+OUT_DIR="./out"
+JOBS=""
+THEME=""
+BACKGROUND=""
+WIDTH=""
+HEIGHT=""
+SCALE=""
+PUPPETEER=""
+RECURSIVE=0
+FORCE=0
+QUIET=0
+INPUTS=()
+
+while (($#)); do
+    case $1 in
+        -f|--format)      FORMAT=${2:?}; shift 2 ;;
+        -o|--outdir)      OUT_DIR=${2:?}; shift 2 ;;
+        -j|--jobs)        JOBS=${2:?}; shift 2 ;;
+        -t|--theme)       THEME=${2:?}; shift 2 ;;
+        -b|--background)  BACKGROUND=${2:?}; shift 2 ;;
+        -w|--width)       WIDTH=${2:?}; shift 2 ;;
+        -H|--height)      HEIGHT=${2:?}; shift 2 ;;
+        -s|--scale)       SCALE=${2:?}; shift 2 ;;
+        -p|--puppeteer)   PUPPETEER=${2:?}; shift 2 ;;
+        -r|--recursive)   RECURSIVE=1; shift ;;
+        --force)          FORCE=1; shift ;;
+        -q|--quiet)       QUIET=1; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        --)               shift; INPUTS+=("$@"); break ;;
+        -*)               err "unknown option: $1"; usage >&2; exit 2 ;;
+        *)                INPUTS+=("$1"); shift ;;
+    esac
+done
+
+# ---------- deps ----------
+command -v mmdc >/dev/null 2>&1 || { err "mermaid-cli (mmdc) not found"; exit 1; }
+
+# ---------- format selection ----------
+if [[ -z $FORMAT ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+        if command -v fzf >/dev/null 2>&1; then
+            FORMAT=$(printf 'png\nsvg\npdf\n' | fzf \
+                --prompt='Output format: ' --height=40% --border) || true
+        else
+            PS3='Output format: '
+            select f in png svg pdf; do FORMAT=$f; break; done
+        fi
+    fi
+    [[ -z $FORMAT ]] && { err "no format selected"; exit 2; }
+fi
+case $FORMAT in
+    png|svg|pdf) ;;
+    *) err "invalid format: $FORMAT (use png|svg|pdf)"; exit 2 ;;
+esac
+
+# ---------- jobs default ----------
+if [[ -z $JOBS ]]; then
+    JOBS=$(nproc 2>/dev/null || echo 4)
+    ((JOBS > 8)) && JOBS=8
+fi
+[[ $JOBS =~ ^[0-9]+$ && $JOBS -ge 1 ]] || { err "invalid -j: $JOBS"; exit 2; }
+
+# ---------- collect files ----------
+collect() {
+    local input f
+    if ((${#INPUTS[@]} == 0)); then
+        if ((RECURSIVE)); then
+            find . -type f -name '*.mmd' -print0
+        else
+            for f in *.mmd; do printf '%s\0' "$f"; done
+        fi
+        return
+    fi
+    for input in "${INPUTS[@]}"; do
+        if [[ -d $input ]]; then
+            if ((RECURSIVE)); then
+                find "$input" -type f -name '*.mmd' -print0
+            else
+                for f in "$input"/*.mmd; do printf '%s\0' "$f"; done
+            fi
+        elif [[ -f $input ]]; then
+            printf '%s\0' "$input"
+        else
+            warn "skipping (not found): $input"
+        fi
+    done
+}
+
+mapfile -d '' FILES < <(collect)
+TOTAL=${#FILES[@]}
+if ((TOTAL == 0)); then
+    warn "no .mmd files found"
+    exit 0
+fi
+
+mkdir -p "$OUT_DIR"
+
+[[ $QUIET -eq 1 ]] || \
+    printf '📄 Rendering %d file(s) → %s  (jobs=%d, outdir=%s)\n' \
+        "$TOTAL" "$FORMAT" "$JOBS" "$OUT_DIR"
+
+# ---------- worker ----------
+render_one() {
+    local file=$1
+    local base=${file##*/}; base=${base%.mmd}
+    local out="$OUT_DIR/${base}.${FORMAT}"
+
+    if [[ ${FORCE:-0} -eq 0 && -f $out && $out -nt $file ]]; then
+        [[ ${QUIET:-0} -eq 1 ]] || printf '⏭  skip (fresh): %s\n' "$file"
+        return 0
+    fi
+
+    local args=()
+    [[ -n ${THEME:-}      ]] && args+=(-t "$THEME")
+    [[ -n ${BACKGROUND:-} ]] && args+=(-b "$BACKGROUND")
+    [[ -n ${WIDTH:-}      ]] && args+=(-w "$WIDTH")
+    [[ -n ${HEIGHT:-}     ]] && args+=(-H "$HEIGHT")
+    [[ -n ${SCALE:-}      ]] && args+=(-s "$SCALE")
+    [[ -n ${PUPPETEER:-}  ]] && args+=(-p "$PUPPETEER")
+
+    local log rc
+    log=$(mmdc -i "$file" -o "$out" "${args[@]}" 2>&1)
+    rc=$?
+    if ((rc == 0)); then
+        [[ ${QUIET:-0} -eq 1 ]] || printf '✓  %s → %s\n' "$file" "$out"
+    else
+        printf '\e[31m✖\e[0m %s (rc=%d)\n' "$file" "$rc" >&2
+        printf '%s\n' "$log" | sed 's/^/    /' >&2
+    fi
+    return $rc
+}
+export -f render_one
+export OUT_DIR FORMAT FORCE QUIET THEME BACKGROUND WIDTH HEIGHT SCALE PUPPETEER
+
+# ---------- cleanup on signals ----------
+TMPRC=$(mktemp)
+cleanup() {
+    local rc=$?
+    pkill -P $$ 2>/dev/null || true
+    rm -f "$TMPRC"
+    trap - EXIT
+    exit "$rc"
+}
+trap cleanup INT TERM EXIT
+
+# ---------- parallel run ----------
+# FD 3 carries OK/FAIL tally so worker stdout stays on the terminal.
+exec 3>"$TMPRC"
+printf '%s\0' "${FILES[@]}" | \
+    xargs -0 -n 1 -P "$JOBS" bash -c '
+        if render_one "$1"; then echo OK >&3; else echo FAIL >&3; fi
+    ' _
+exec 3>&-
+
+OK=$(grep -c   '^OK$'   "$TMPRC" || true)
+FAIL=$(grep -c '^FAIL$' "$TMPRC" || true)
+
+echo
+if ((FAIL == 0)); then
+    printf '\e[32m✅ done: %d ok\e[0m\n' "$OK"
+    exit 0
+else
+    printf '\e[31m❌ done: %d ok / %d failed\e[0m\n' "$OK" "$FAIL" >&2
+    exit 1
+fi
